@@ -178,18 +178,18 @@ app = Client("my_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 async def start_handler(client, message: Message):
     if not is_admin(message.from_user.id):
         return # Silent ignore for non-admins
-    await message.reply_text(
+        await message.reply_text(
         "👨‍💻 **Credential Checker Bot**\n\n"
         "I can validate credentials from a text file.\n\n"
         "**Format:**\n"
-        `URL:email:password` or `URL:username:password`\n\n"
+        "URL:email:password or URL:username:password\n\n"
         "**How to use:**\n"
         "1. Send a `.txt` file with your list.\n"
         "2. I will check each line and return a new file with ONLY valid credentials.\n\n"
         "⚠️ **Note:**\n"
         "- Progress updates are sent every 10%.\n"
         "- Do not send multiple files at once."
-    )
+        )
 
 @app.on_message(filters.document)
 async def handle_document(client, message: Message):
