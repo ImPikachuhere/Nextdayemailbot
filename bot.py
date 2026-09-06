@@ -135,7 +135,7 @@ Response Snippet (first 500 chars):
                 # Without verifying the destination (which requires following the redirect), we treat this as a failure 
                 # OR we need to check the 'Location' header. 
                 # For safety and simplicity in a checker, unless we know the exact success redirect URL, we return False.
-                logger.warning(f"{target_info} | Redirect Detected ({status}). Location: {headers.get('Location', 'Unknown'). This usually indicates a failure or requires complex handling. Treating as Invalid.")
+                logger.warning(f"{target_info} | Redirect Detected ({status}). Location: {headers.get('Location', 'Unknown')}. This usually indicates a failure or requires complex handling. Treating as Invalid.")
                 return False
 
             # 4. Success Case (200 OK)
