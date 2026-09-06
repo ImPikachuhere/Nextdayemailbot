@@ -184,8 +184,9 @@ app = Client("my_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 @app.on_message(filters.command("start"))
 async def start_handler(client, message: Message):
     if not is_admin(message.from_user.id):
-        return # Silent ignore for non-admins
-        await message.reply_text(
+    return
+
+await message.reply_text(
         "👨‍💻 **Credential Checker Bot**\n\n"
         "I can validate credentials from a text file.\n\n"
         "**Format:**\n"
