@@ -4,6 +4,13 @@ import logging
 import threading
 import aiohttp
 import asyncio
+
+# Fix for Pyrogram on Python 3.14+
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
+
 from flask import Flask
 from pyrogram import Client, filters, enums
 from pyrogram.types import Message, InputMediaDocument
