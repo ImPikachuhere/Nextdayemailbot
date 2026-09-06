@@ -209,9 +209,8 @@ async def handle_document(client, message: Message):
         await message.reply_text("❌ Invalid file type. Please send a `.txt` file only.")
         return
     
-    file_path = "input_credentials.txt"
     try:
-        await message.download(file_path)
+        file_path = await message.download()
     except Exception as e:
         await message.reply_text(f"❌ Failed to download file: {str(e)}")
         return
