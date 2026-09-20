@@ -496,8 +496,8 @@ async def start_handler(client: Client, message: Message):
 • `/status` - Bot status
 • `/refreshproxies` - Refresh proxies
 
-**File Format:**https://site.com/wp-login.php:admin:password123
-https://site2.com/login:user@email.com
+**File Format:**```https://site.com/wp-login.php:admin:password123
+https://site2.com/login:user@email.com:pass123```
 
 Add `{user_id}` to ADMINS to use."""
     
