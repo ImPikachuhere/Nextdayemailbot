@@ -3,3 +3,4 @@ tgcrypto
 flask
 aiohttp
 aiohttp-socks
+requests
