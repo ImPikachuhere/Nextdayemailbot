@@ -1,7 +1,8 @@
 pyrogram
 tgcrypto
 flask
-aiohttp
-aiohttp-socks
 requests
-nest_asyncio
+urllib3
+certifi
+charset-normalizer
+idna
