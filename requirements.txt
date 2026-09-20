@@ -2,3 +2,4 @@ pyrogram
 tgcrypto
 flask
 aiohttp
+aiohttp-socks
