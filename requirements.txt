@@ -4,3 +4,4 @@ flask
 aiohttp
 aiohttp-socks
 requests
+nest_asyncio
